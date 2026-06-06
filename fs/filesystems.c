@@ -46,6 +46,8 @@ void put_filesystem(struct file_system_type *fs)
 	module_put(fs->owner);
 }
 
+EXPORT_SYMBOL(put_filesystem);
+
 static struct file_system_type **find_filesystem(const char *name, unsigned len)
 {
 	struct file_system_type **p;

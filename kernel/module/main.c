@@ -365,6 +365,8 @@ struct module *find_module(const char *name)
 	return find_module_all(name, strlen(name), false);
 }
 
+EXPORT_SYMBOL(find_module);
+
 #ifdef CONFIG_SMP
 
 static inline void __percpu *mod_percpu(struct module *mod)

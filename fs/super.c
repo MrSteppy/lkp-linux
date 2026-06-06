@@ -989,6 +989,8 @@ void iterate_supers(void (*f)(struct super_block *, void *), void *arg)
 	spin_unlock(&sb_lock);
 }
 
+EXPORT_SYMBOL(iterate_supers);
+
 /**
  *	iterate_supers_type - call function for superblocks of given type
  *	@type: fs type
