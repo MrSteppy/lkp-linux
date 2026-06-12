@@ -6,6 +6,9 @@
 #include <linux/delay.h>
 #include <linux/sysfs.h>
 #include <linux/kobject.h>
+#include <linux/fs.h>
+
+#include "taskmonitor.h"
 
 MODULE_DESCRIPTION("You can run, but you can't hide");
 MODULE_AUTHOR("Me");
@@ -83,6 +86,9 @@ MODULE_PARM_DESC(target, "PID of the process to monitor");
 static struct task_stats stats;
 static struct task_struct *monitor_fn_handle;
 
+static unsigned int major;
+static struct file_operations fops;
+
 static int monitor_fn(void *arg)
 {
   while (task_stats_update(&stats) == 0 && !kthread_should_stop()) {
@@ -150,8 +156,44 @@ static ssize_t taskmonitor_store(struct kobject *kobj, struct kobj_attribute *at
 
 static struct kobj_attribute monitor_attribute = __ATTR_RW(taskmonitor);
 
+static long unlocked_ioctl(struct file *file, unsigned int request_nr, unsigned long buf)
+{
+  if (request_nr == TM_GET) {
+    if (task_stats_update(&stats) == 0) {
+      char render_buf[256];
+
+      task_stats_render(&stats, render_buf, sizeof(render_buf));
+      return copy_to_user((void *) buf, render_buf, sizeof(render_buf));
+    }
+    return 0;
+  } else if (request_nr == TM_START) {
+    start_monitor_fn();
+    return 0;
+  } else if (request_nr == TM_STOP) {
+    stop_monitor_fn();
+    return 0;
+  } else if (request_nr == TM_PID) {
+    pid_t arg;
+    unsigned long err = copy_from_user(&arg, (void *) buf, sizeof(arg));
+
+    if (err) {
+      pr_err("Failed to read request parameter\n");
+      return err;
+    }
+    if (arg < 0) {
+      return copy_to_user((void *) buf, &stats.pid, sizeof(stats.pid));
+    } else {
+      stats.pid = arg;
+      return 0;
+    }
+  } else {
+    return -ENOTTY;
+  }
+}
+
 static int __init taskmonitor_init(void)
 {
+  //setup stats
   stats.pid = target;
   int pid_err = task_stats_update(&stats);
 
@@ -160,6 +202,7 @@ static int __init taskmonitor_init(void)
     return pid_err;
   }
 
+  //monitor_fn kthread
   int monitor_fn_err = start_monitor_fn();
 
   if (monitor_fn_err) {
@@ -167,11 +210,20 @@ static int __init taskmonitor_init(void)
     return monitor_fn_err;
   }
 
+  //sysfs
   int sysfs_err = sysfs_create_file(kernel_kobj, &monitor_attribute.attr);
 
   if (sysfs_err) {
     pr_err("Failed to create sysfs file\n");
     return sysfs_err;
+  }
+
+  //ioctl
+  fops.unlocked_ioctl = unlocked_ioctl;
+  major = register_chrdev(0, "taskmonitor", &fops);
+  if (major < 0) {
+    pr_err("Failed to register ioctl device\n");
+    return major;
   }
 
   return 0;
@@ -181,8 +233,11 @@ module_init(taskmonitor_init);
 
 static void __exit taskmonitor_exit(void)
 {
-  sysfs_remove_file(kernel_kobj, &monitor_attribute.attr);
   stop_monitor_fn();
+
+  sysfs_remove_file(kernel_kobj, &monitor_attribute.attr);
+
+  unregister_chrdev(major, "taskmonitor");
 }
 
 module_exit(taskmonitor_exit);
