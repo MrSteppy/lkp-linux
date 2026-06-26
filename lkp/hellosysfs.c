@@ -12,7 +12,8 @@ static char what[256] = "sysfs";
 
 static ssize_t hello_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
-  return sysfs_emit(buf, "Hello %s\n", what);
+
+  return sysfs_emit(buf, "Hello %s!\n", what);
 }
 
 static ssize_t hello_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count)
