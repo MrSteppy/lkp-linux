@@ -17,10 +17,17 @@ MODULE_LICENSE("GPL");
 struct task_sample {
   u64 utime;
   u64 stime;
+  unsigned long vm_total;
+  unsigned long vm_stack;
+  unsigned long vm_data;
+  struct list_head list;
 };
 
 struct task_monitor {
   pid_t pid;
+  struct list_head samples;
+  int samples_size;
+  struct mutex samples_lock;
 };
 
 static pid_t target;
@@ -34,7 +41,14 @@ static struct task_struct *monitor_fn_handle;
 static unsigned int major;
 static struct file_operations fops;
 
-static bool get_sample(const struct task_monitor *monitor, struct task_sample *sample)
+void init_task_monitor(struct task_monitor *monitor, pid_t pid)
+{
+  mutex_init(&monitor->samples_lock);
+  INIT_LIST_HEAD(&monitor->samples);
+  monitor->pid = pid;
+}
+
+bool get_sample(const struct task_monitor *monitor, struct task_sample *sample)
 {
   bool sample_okay = false;
   pid_t pid_nr = monitor->pid;
@@ -59,6 +73,14 @@ static bool get_sample(const struct task_monitor *monitor, struct task_sample *s
 
   sample->utime = task->utime;
   sample->stime = task->stime;
+  struct mm_struct *mm = task->mm;
+
+  if (mm) {
+    sample->vm_total = mm->total_vm;
+    sample->vm_stack = mm->stack_vm;
+    sample->vm_data = mm->data_vm;
+  }
+
   sample_okay = true;
 
 put_task_struct:
@@ -73,16 +95,40 @@ no_pid:
 
 static int render_task_sample(const struct task_monitor *monitor, struct task_sample *sample, char *buf, size_t buffer_len)
 {
-  return snprintf(buf, buffer_len, "pid %d usr %llu sys %llu", monitor->pid, sample->utime, sample->stime);
+  return snprintf(buf, buffer_len, "pid %d usr %llu sys %llu vm_total %lu vm_stack %lu vm_data %lu", monitor->pid, sample->utime, sample->stime, sample->vm_total, sample->vm_stack, sample->vm_data);
+}
+
+static int save_sample(void)
+{
+  int res = 0;
+
+  struct task_sample *sample = kmalloc(sizeof(struct task_sample), GFP_KERNEL);
+
+  if (!sample) {
+    pr_err("Failed to allocate space for a new task_sample\n");
+    res = -1;
+    goto sample_failure;
+  }
+
+  bool sample_okay = get_sample(&task_monitor, sample);
+
+  if (!sample_okay) {
+    res = -2;
+    goto sample_failure;
+  }
+
+  mutex_lock(&task_monitor.samples_lock);
+  list_add_tail(&sample->list, &task_monitor.samples);
+  task_monitor.samples_size += 1;
+  mutex_unlock(&task_monitor.samples_lock);
+
+sample_failure:
+  return res;
 }
 
 static int monitor_fn(void *arg)
 {
-  while (get_sample(&task_monitor, &task_sample) && !kthread_should_stop()) {
-    char buf[256];
-
-    render_task_sample(&task_monitor, &task_sample, buf, sizeof(buf));
-    pr_info("%s\n", buf);
+  while (!save_sample() && !kthread_should_stop()) {
     ssleep(1);
   }
 
@@ -122,14 +168,21 @@ static int stop_monitor_fn(void)
 
 static ssize_t taskmonitor_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
-  if (get_sample(&task_monitor, &task_sample)) {
-    char render_buf[256];
+  char render_buf[1000];
+  int offset = 0;
+  struct task_sample *sample;
+  bool first = true;
 
-    render_task_sample(&task_monitor, &task_sample, render_buf, sizeof(render_buf));
-    return sysfs_emit(buf, "%s\n", render_buf);
+  list_for_each_entry(sample, &task_monitor.samples, list) {
+    if (first) {
+      first = false;
+    } else {
+      offset += snprintf(render_buf + offset, sizeof(render_buf) - offset, "\n");
+    }
+    offset += render_task_sample(&task_monitor, sample, render_buf + offset, sizeof(render_buf) - offset);
   }
 
-  return sysfs_emit(buf, "-\n");
+  return sysfs_emit(buf, "%s\n", render_buf); //check patch automatically adds a \n here
 }
 
 static ssize_t taskmonitor_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count)
@@ -181,8 +234,10 @@ static long unlocked_ioctl(struct file *file, unsigned int request_nr, unsigned 
 
 static int __init taskmonitor_init(void)
 {
-  //setup stats
-  task_monitor.pid = target;
+  pr_info("Initializing task_monitor struct...\n");
+  init_task_monitor(&task_monitor, target);
+
+  pr_info("Checking pid...\n");
   bool sample_okay = get_sample(&task_monitor, &task_sample);
 
   if (!sample_okay) {
@@ -191,6 +246,7 @@ static int __init taskmonitor_init(void)
   }
 
   //monitor_fn kthread
+  pr_info("Starting monitoring thread...\n");
   int monitor_fn_err = start_monitor_fn();
 
   if (monitor_fn_err) {
@@ -199,6 +255,7 @@ static int __init taskmonitor_init(void)
   }
 
   //sysfs
+  pr_info("Creating sysfs interface...\n");
   int sysfs_err = sysfs_create_file(kernel_kobj, &monitor_attribute.attr);
 
   if (sysfs_err) {
@@ -207,12 +264,15 @@ static int __init taskmonitor_init(void)
   }
 
   //ioctl
+  pr_info("Creating ioctl interface...\n");
   fops.unlocked_ioctl = unlocked_ioctl;
   major = register_chrdev(0, "taskmonitor", &fops);
   if (major < 0) {
     pr_err("Failed to register ioctl device\n");
     return major;
   }
+
+  pr_info("Done!\n");
 
   return 0;
 }
@@ -221,11 +281,27 @@ module_init(taskmonitor_init);
 
 static void __exit taskmonitor_exit(void)
 {
+  pr_info("Stopping monitor thread...\n");
   stop_monitor_fn();
 
+  pr_info("Removing sysfs interface...\n");
   sysfs_remove_file(kernel_kobj, &monitor_attribute.attr);
 
+  pr_info("Removing ioctl interface...\n");
   unregister_chrdev(major, "taskmonitor");
+
+  pr_info("Freeing allocated memory...\n");
+  mutex_lock(&task_monitor.samples_lock);
+  struct task_sample *sample, *tmp;
+
+  list_for_each_entry_safe(sample, tmp, &task_monitor.samples, list) {
+    list_del(&sample->list);
+    kfree(sample);
+  }
+  task_monitor.samples_size = 0;
+  mutex_unlock(&task_monitor.samples_lock);
+
+  pr_info("Done.\n");
 }
 
 module_exit(taskmonitor_exit);
