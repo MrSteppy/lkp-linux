@@ -26,20 +26,9 @@ struct task_sample {
 struct task_monitor {
   pid_t pid;
   struct list_head samples;
-  int samples_size;
+  unsigned int samples_size;
   struct mutex samples_lock;
 };
-
-static pid_t target;
-module_param(target, int, 0444);
-MODULE_PARM_DESC(target, "PID of the process to monitor");
-
-static struct task_sample task_sample;
-static struct task_monitor task_monitor;
-static struct task_struct *monitor_fn_handle;
-
-static unsigned int major;
-static struct file_operations fops;
 
 void init_task_monitor(struct task_monitor *monitor, pid_t pid)
 {
@@ -93,10 +82,58 @@ no_pid:
   return sample_okay;
 }
 
-static int render_task_sample(const struct task_monitor *monitor, struct task_sample *sample, char *buf, size_t buffer_len)
+int render_task_sample(const struct task_monitor *monitor, struct task_sample *sample, char *buf, size_t buffer_len)
 {
   return snprintf(buf, buffer_len, "pid %d usr %llu sys %llu vm_total %lu vm_stack %lu vm_data %lu", monitor->pid, sample->utime, sample->stime, sample->vm_total, sample->vm_stack, sample->vm_data);
 }
+
+static pid_t target;
+module_param(target, int, 0444);
+MODULE_PARM_DESC(target, "PID of the process to monitor");
+
+static struct task_sample task_sample;
+static struct task_monitor task_monitor;
+static struct task_struct *monitor_fn_handle;
+static unsigned int major;
+static struct file_operations fops;
+
+static unsigned long taskmonitor_count_objects(struct shrinker *shrink, struct shrink_control *sc)
+{
+  mutex_lock(&task_monitor.samples_lock);
+  unsigned int samples_size = task_monitor.samples_size;
+
+  mutex_unlock(&task_monitor.samples_lock);
+
+  return samples_size ? samples_size : SHRINK_EMPTY;
+}
+
+static unsigned long taskmonitor_scan_objects(struct shrinker *shrink, struct shrink_control *sc)
+{
+  unsigned long freed = 0;
+  int nr_to_scan = sc->nr_to_scan;
+
+  mutex_lock(&task_monitor.samples_lock);
+  struct task_sample *sample, *tmp;
+
+  list_for_each_entry_safe(sample, tmp, &task_monitor.samples, list) {
+    if (!nr_to_scan--) {
+      break;
+    }
+
+    list_del(&sample->list);
+    kfree(sample);
+    task_monitor.samples_size--;
+    freed++;
+  }
+
+  mutex_unlock(&task_monitor.samples_lock);
+  return freed;
+}
+
+static struct shrinker taskmonitor_shrinker = {
+  .count_objects = taskmonitor_count_objects,
+  .scan_objects = taskmonitor_scan_objects,
+};
 
 static int save_sample(void)
 {
@@ -137,7 +174,7 @@ static int monitor_fn(void *arg)
 
 static int start_monitor_fn(void)
 {
-  //TODO best use a mutex here
+  //TODO maybe use a mutex here?
   if (monitor_fn_handle) {
     pr_err("monitor_fn is already running\n");
     return -1;
@@ -182,7 +219,7 @@ static ssize_t taskmonitor_show(struct kobject *kobj, struct kobj_attribute *att
     offset += render_task_sample(&task_monitor, sample, render_buf + offset, sizeof(render_buf) - offset);
   }
 
-  return sysfs_emit(buf, "%s\n", render_buf); //check patch automatically adds a \n here
+  return sysfs_emit(buf, "%s\n", render_buf); //check patch automatically adds a\n here
 }
 
 static ssize_t taskmonitor_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count)
@@ -272,6 +309,15 @@ static int __init taskmonitor_init(void)
     return major;
   }
 
+  //shrinker
+  pr_info("Registering shrinker...\n");
+  int shrinker_err = register_shrinker(&taskmonitor_shrinker, "taskmonitor");
+
+  if (shrinker_err) {
+    pr_err("Failed to register shrinker\n");
+    return shrinker_err;
+  }
+
   pr_info("Done!\n");
 
   return 0;
@@ -300,6 +346,9 @@ static void __exit taskmonitor_exit(void)
   }
   task_monitor.samples_size = 0;
   mutex_unlock(&task_monitor.samples_lock);
+
+  pr_info("Unregistering shrinker...\n");
+  unregister_shrinker(&taskmonitor_shrinker);
 
   pr_info("Done.\n");
 }
