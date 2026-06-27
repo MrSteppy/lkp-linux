@@ -22,6 +22,7 @@ struct task_sample {
   unsigned long vm_stack;
   unsigned long vm_data;
   struct list_head list;
+  struct kref kref;
 };
 
 struct task_monitor {
@@ -100,6 +101,17 @@ static struct file_operations fops;
 static struct kmem_cache *task_sample_cache;
 static mempool_t *task_sample_mempool;
 
+static void release_task_sample(struct kref *kref)
+{
+  struct task_sample *sample = container_of(kref, struct task_sample, kref);
+  kmem_cache_free(task_sample_cache, sample);
+}
+
+static void put_task_sample(struct task_sample *sample)
+{
+  kref_put(&sample->kref, release_task_sample);
+}
+
 static unsigned long taskmonitor_count_objects(struct shrinker *shrink, struct shrink_control *sc)
 {
   mutex_lock(&task_monitor.samples_lock);
@@ -124,7 +136,7 @@ static unsigned long taskmonitor_scan_objects(struct shrinker *shrink, struct sh
     }
 
     list_del(&sample->list);
-    kmem_cache_free(task_sample_cache, sample);
+    put_task_sample(sample);
     task_monitor.samples_size--;
     freed++;
   }
@@ -147,14 +159,15 @@ static int save_sample(void)
   if (!sample) {
     pr_err("Failed to allocate space for a new task_sample\n");
     res = -1;
-    goto sample_failure;
+    goto out_alloc_err;
   }
 
+  kref_init(&sample->kref);
   bool sample_okay = get_sample(&task_monitor, sample);
 
   if (!sample_okay) {
     res = -2;
-    goto sample_failure;
+    goto out_sample_failure;
   }
 
   mutex_lock(&task_monitor.samples_lock);
@@ -162,7 +175,17 @@ static int save_sample(void)
   task_monitor.samples_size += 1;
   mutex_unlock(&task_monitor.samples_lock);
 
-sample_failure:
+  kref_get(&sample->kref);
+  char buf[256];
+  render_task_sample(&task_monitor, sample, buf, sizeof(buf));
+  put_task_sample(sample);
+  pr_info("%s\n", buf);
+
+  return 0;
+
+out_sample_failure:
+  put_task_sample(sample);
+out_alloc_err:
   return res;
 }
 
@@ -363,7 +386,7 @@ static void __exit taskmonitor_exit(void)
 
   list_for_each_entry_safe(sample, tmp, &task_monitor.samples, list) {
     list_del(&sample->list);
-    kmem_cache_free(task_sample_cache, sample);
+    put_task_sample(sample);
   }
   task_monitor.samples_size = 0;
   mutex_unlock(&task_monitor.samples_lock);
