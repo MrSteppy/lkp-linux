@@ -7,6 +7,7 @@
 #include <linux/sysfs.h>
 #include <linux/kobject.h>
 #include <linux/fs.h>
+#include <linux/mempool.h>
 
 #include "taskmonitor.h"
 
@@ -97,6 +98,7 @@ static struct task_struct *monitor_fn_handle;
 static unsigned int major;
 static struct file_operations fops;
 static struct kmem_cache *task_sample_cache;
+static mempool_t *task_sample_mempool;
 
 static unsigned long taskmonitor_count_objects(struct shrinker *shrink, struct shrink_control *sc)
 {
@@ -285,6 +287,14 @@ static int __init taskmonitor_init(void)
     return -1;
   }
 
+  //mempool
+  pr_info("Initializing mempool...\n");
+  task_sample_mempool = mempool_create_slab_pool(16, task_sample_cache);
+  if (!task_sample_mempool) {
+    pr_err("Failed to initialize mempool\n");
+    return -1;
+  }
+
   pr_info("Checking pid...\n");
   bool sample_okay = get_sample(&task_monitor, &task_sample);
 
@@ -361,7 +371,10 @@ static void __exit taskmonitor_exit(void)
   pr_info("Unregistering shrinker...\n");
   unregister_shrinker(&taskmonitor_shrinker);
 
-  pr_info("Releasing slabs cache...\n");
+  pr_info("Destroying mempool...\n");
+  mempool_destroy(task_sample_mempool);
+
+  pr_info("Destroying slabs cache...\n");
   kmem_cache_destroy(task_sample_cache);
 
   pr_info("Done.\n");
