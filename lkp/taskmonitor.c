@@ -211,6 +211,7 @@ static ssize_t taskmonitor_show(struct kobject *kobj, struct kobj_attribute *att
   struct task_sample *sample;
   bool first = true;
 
+  mutex_lock(&task_monitor.samples_lock);
   list_for_each_entry(sample, &task_monitor.samples, list) {
     if (first) {
       first = false;
@@ -219,6 +220,7 @@ static ssize_t taskmonitor_show(struct kobject *kobj, struct kobj_attribute *att
     }
     offset += render_task_sample(&task_monitor, sample, render_buf + offset, sizeof(render_buf) - offset);
   }
+  mutex_unlock(&task_monitor.samples_lock);
 
   return sysfs_emit(buf, "%s\n", render_buf); //check patch automatically adds a\n here
 }
