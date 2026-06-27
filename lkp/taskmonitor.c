@@ -96,6 +96,7 @@ static struct task_monitor task_monitor;
 static struct task_struct *monitor_fn_handle;
 static unsigned int major;
 static struct file_operations fops;
+static struct kmem_cache *task_sample_cache;
 
 static unsigned long taskmonitor_count_objects(struct shrinker *shrink, struct shrink_control *sc)
 {
@@ -121,7 +122,7 @@ static unsigned long taskmonitor_scan_objects(struct shrinker *shrink, struct sh
     }
 
     list_del(&sample->list);
-    kfree(sample);
+    kmem_cache_free(task_sample_cache, sample);
     task_monitor.samples_size--;
     freed++;
   }
@@ -139,7 +140,7 @@ static int save_sample(void)
 {
   int res = 0;
 
-  struct task_sample *sample = kmalloc(sizeof(struct task_sample), GFP_KERNEL);
+  struct task_sample *sample = kmem_cache_alloc(task_sample_cache, GFP_KERNEL);
 
   if (!sample) {
     pr_err("Failed to allocate space for a new task_sample\n");
@@ -274,6 +275,14 @@ static int __init taskmonitor_init(void)
   pr_info("Initializing task_monitor struct...\n");
   init_task_monitor(&task_monitor, target);
 
+  //slabs
+  pr_info("Creating slabs cache...\n");
+  task_sample_cache = KMEM_CACHE(task_sample, 0);
+  if (!task_sample_cache) {
+    pr_err("Failed to create slabs cache\n");
+    return -1;
+  }
+
   pr_info("Checking pid...\n");
   bool sample_okay = get_sample(&task_monitor, &task_sample);
 
@@ -342,13 +351,16 @@ static void __exit taskmonitor_exit(void)
 
   list_for_each_entry_safe(sample, tmp, &task_monitor.samples, list) {
     list_del(&sample->list);
-    kfree(sample);
+    kmem_cache_free(task_sample_cache, sample);
   }
   task_monitor.samples_size = 0;
   mutex_unlock(&task_monitor.samples_lock);
 
   pr_info("Unregistering shrinker...\n");
   unregister_shrinker(&taskmonitor_shrinker);
+
+  pr_info("Releasing slabs cache...\n");
+  kmem_cache_destroy(task_sample_cache);
 
   pr_info("Done.\n");
 }
