@@ -32,6 +32,8 @@ struct task_monitor {
   struct list_head samples;
   unsigned int samples_size;
   struct mutex samples_lock;
+  struct list_head list;
+  struct dentry *dentry;
 };
 
 void init_task_monitor(struct task_monitor *monitor, pid_t pid)
@@ -39,6 +41,21 @@ void init_task_monitor(struct task_monitor *monitor, pid_t pid)
   mutex_init(&monitor->samples_lock);
   INIT_LIST_HEAD(&monitor->samples);
   monitor->pid = pid;
+  INIT_LIST_HEAD(&monitor->list);
+  monitor->dentry = NULL;
+}
+
+struct task_monitor *task_monitor_new(pid_t pid)
+{
+  struct task_monitor *monitor = kmalloc(sizeof(struct task_monitor), GFP_KERNEL);
+
+  if (!monitor) {
+    return NULL;
+  }
+
+  init_task_monitor(monitor, pid);
+
+  return monitor;
 }
 
 bool get_sample(const struct task_monitor *monitor, struct task_sample *sample)
@@ -91,20 +108,53 @@ int render_task_sample(const struct task_monitor *monitor, struct task_sample *s
   return snprintf(buf, buffer_len, "pid %d usr %llu sys %llu vm_total %lu vm_stack %lu vm_data %lu", monitor->pid, sample->utime, sample->stime, sample->vm_total, sample->vm_stack, sample->vm_data);
 }
 
+static long unlocked_ioctl(struct file *, unsigned int, unsigned long);
+static int taskmonitor_open(struct inode *, struct file *);
+static ssize_t taskmonitor_write(struct file*, const char __user *, size_t, loff_t *);
+static ssize_t taskmonitor_show(struct kobject *, struct kobj_attribute *, char *);
+static ssize_t taskmonitor_store(struct kobject *, struct kobj_attribute *, const char *, size_t);
+static unsigned long taskmonitor_count_objects(struct shrinker *, struct shrink_control *);
+static unsigned long taskmonitor_scan_objects(struct shrinker *, struct shrink_control *);
+static void *taskmonitor_seq_start(struct seq_file *, loff_t *);
+static void *taskmonitor_seq_next(struct seq_file *, void *, loff_t *);
+static void taskmonitor_seq_stop(struct seq_file *, void *);
+static int taskmonitor_seq_show(struct seq_file *, void *);
+
 static pid_t target;
 module_param(target, int, 0444);
 MODULE_PARM_DESC(target, "PID of the process to monitor");
 
-static struct task_sample task_sample;
 static struct task_monitor task_monitor;
 static struct task_struct *monitor_fn_handle;
+static const struct kobj_attribute monitor_attribute = __ATTR_RW(taskmonitor);
 static unsigned int major;
 static struct kmem_cache *task_sample_cache;
 static mempool_t *task_sample_mempool;
+static struct list_head tasks;
+static const struct file_operations fops = {
+  .owner = THIS_MODULE,
+  .unlocked_ioctl = unlocked_ioctl,
+  .open = taskmonitor_open,
+  .read = seq_read,
+  .write = taskmonitor_write,
+  .llseek = seq_lseek,
+  .release = seq_release,
+};
+static struct shrinker taskmonitor_shrinker = {
+  .count_objects = taskmonitor_count_objects,
+  .scan_objects = taskmonitor_scan_objects,
+};
+static struct dentry *dentry;
+static const struct seq_operations taskmonitor_seq_ops = {
+  .start = taskmonitor_seq_start,
+  .next  = taskmonitor_seq_next,
+  .stop  = taskmonitor_seq_stop,
+  .show  = taskmonitor_seq_show,
+};
 
 static void free_task_sample(struct task_sample *sample)
 {
-  kmem_cache_free(task_sample_cache, sample);
+  mempool_free(sample, task_sample_mempool);
 }
 
 static void release_task_sample(struct kref *kref)
@@ -122,6 +172,19 @@ static void put_task_sample(struct task_sample *sample)
 static void get_task_sample(struct task_sample *sample)
 {
   kref_get(&sample->kref);
+}
+
+static void task_monitor_clear_samples(struct task_monitor *monitor)
+{
+  mutex_lock(&monitor->samples_lock);
+  struct task_sample *sample, *tmp;
+
+  list_for_each_entry_safe(sample, tmp, &monitor->samples, list) {
+    list_del(&sample->list);
+    put_task_sample(sample);
+  }
+  monitor->samples_size = 0;
+  mutex_unlock(&monitor->samples_lock);
 }
 
 static unsigned long taskmonitor_count_objects(struct shrinker *shrink, struct shrink_control *sc)
@@ -157,16 +220,11 @@ static unsigned long taskmonitor_scan_objects(struct shrinker *shrink, struct sh
   return freed;
 }
 
-static struct shrinker taskmonitor_shrinker = {
-  .count_objects = taskmonitor_count_objects,
-  .scan_objects = taskmonitor_scan_objects,
-};
-
-static int save_sample(void)
+static int save_sample(struct task_monitor *monitor)
 {
   int res = 0;
 
-  struct task_sample *sample = kmem_cache_alloc(task_sample_cache, GFP_KERNEL);
+  struct task_sample *sample = mempool_alloc(task_sample_mempool, GFP_KERNEL);
 
   if (!sample) {
     pr_err("Failed to allocate space for a new task_sample\n");
@@ -175,25 +233,28 @@ static int save_sample(void)
   }
 
   kref_init(&sample->kref);
-  bool sample_okay = get_sample(&task_monitor, sample);
+  bool sample_okay = get_sample(monitor, sample);
 
   if (!sample_okay) {
     res = -2;
     goto out_sample_failure;
   }
 
-  get_task_sample(sample); //increment ref here, since we use samle in list AND for printing
+  get_task_sample(sample); //increment ref here, since we use sample in list AND for printing
 
-  mutex_lock(&task_monitor.samples_lock);
-  list_add_tail(&sample->list, &task_monitor.samples);
-  task_monitor.samples_size += 1;
-  mutex_unlock(&task_monitor.samples_lock);
+  mutex_lock(&monitor->samples_lock);
+  list_add_tail(&sample->list, &monitor->samples);
+  monitor->samples_size += 1;
+  mutex_unlock(&monitor->samples_lock);
 
-  char buf[256];
+  if (monitor == &task_monitor) {
+    char buf[256];
 
-  render_task_sample(&task_monitor, sample, buf, sizeof(buf));
+    render_task_sample(monitor, sample, buf, sizeof(buf));
+    pr_info("%s\n", buf);
+  }
+
   put_task_sample(sample);
-  pr_info("%s\n", buf);
 
   return 0;
 
@@ -205,7 +266,13 @@ out_alloc_err:
 
 static int monitor_fn(void *arg)
 {
-  while (!save_sample() && !kthread_should_stop()) {
+  while (!kthread_should_stop()) {
+    save_sample(&task_monitor);
+    struct task_monitor *monitor;
+
+    list_for_each_entry(monitor, &tasks, list) {
+      save_sample(monitor);
+    }
     ssleep(1);
   }
 
@@ -274,15 +341,15 @@ static ssize_t taskmonitor_store(struct kobject *kobj, struct kobj_attribute *at
   return count;
 }
 
-static struct kobj_attribute monitor_attribute = __ATTR_RW(taskmonitor);
-
 static long unlocked_ioctl(struct file *file, unsigned int request_nr, unsigned long buf)
 {
   if (request_nr == TM_GET) {
-    if (get_sample(&task_monitor, &task_sample)) {
+    struct task_sample sample;
+
+    if (get_sample(&task_monitor, &sample)) {
       char render_buf[256];
 
-      render_task_sample(&task_monitor, &task_sample, render_buf, sizeof(render_buf));
+      render_task_sample(&task_monitor, &sample, render_buf, sizeof(render_buf));
       return copy_to_user((void *) buf, render_buf, sizeof(render_buf));
     }
     return 0;
@@ -313,11 +380,13 @@ static long unlocked_ioctl(struct file *file, unsigned int request_nr, unsigned 
 
 static void *taskmonitor_seq_start(struct seq_file *seq, loff_t *pos)
 {
-  mutex_lock(&task_monitor.samples_lock);
+  struct task_monitor *monitor = seq->private;
+
+  mutex_lock(&monitor->samples_lock);
   loff_t n = *pos;
   struct task_sample *sample;
 
-  list_for_each_entry(sample, &task_monitor.samples, list) {
+  list_for_each_entry(sample, &monitor->samples, list) {
     if (n-- > 0) {
       continue;
     }
@@ -331,13 +400,14 @@ static void *taskmonitor_seq_start(struct seq_file *seq, loff_t *pos)
 
 static void *taskmonitor_seq_next(struct seq_file *seq, void *v, loff_t *pos)
 {
+  struct task_monitor *monitor = seq->private;
   struct task_sample *old_sample = v;
   struct task_sample *next_sample = NULL;
   struct task_sample *sample = old_sample;
 
   ++*pos;
 
-  list_for_each_entry_continue(sample, &task_monitor.samples, list) {
+  list_for_each_entry_continue(sample, &monitor->samples, list) {
     get_task_sample(sample);
     next_sample = sample;
     break;
@@ -349,51 +419,97 @@ static void *taskmonitor_seq_next(struct seq_file *seq, void *v, loff_t *pos)
 
 static void taskmonitor_seq_stop(struct seq_file *seq, void *v)
 {
+  struct task_monitor *monitor = seq->private;
   struct task_sample *sample = v;
 
   if (sample) {
     put_task_sample(sample);
   }
-  mutex_unlock(&task_monitor.samples_lock);
+  mutex_unlock(&monitor->samples_lock);
 }
 
 
 static int taskmonitor_seq_show(struct seq_file *seq, void *v)
 {
+  struct task_monitor *monitor = seq->private;
   struct task_sample *sample = v;
   char buf[256];
 
-  render_task_sample(&task_monitor, sample, buf, sizeof(buf));
+  render_task_sample(monitor, sample, buf, sizeof(buf));
   seq_printf(seq, "%s\n", buf);
   return 0;
 }
 
-static const struct seq_operations taskmonitor_seq_ops = {
-  .start = taskmonitor_seq_start,
-  .next  = taskmonitor_seq_next,
-  .stop  = taskmonitor_seq_stop,
-  .show  = taskmonitor_seq_show,
-};
-
 static int taskmonitor_open(struct inode *inode, struct file *file)
 {
-  return seq_open(file, &taskmonitor_seq_ops);
+  int err = seq_open(file, &taskmonitor_seq_ops);
+
+  if (err) {
+    return err;
+  }
+
+  struct seq_file *seq = file->private_data;
+
+  seq->private = inode->i_private;
+
+  return 0;
 }
 
-static struct file_operations fops = {
-  .owner = THIS_MODULE,
-  .unlocked_ioctl = unlocked_ioctl,
-  .open = taskmonitor_open,
-  .read = seq_read,
-  .llseek = seq_lseek,
-  .release = seq_release,
-};
+static ssize_t taskmonitor_write(struct file *file, const char __user *user_buf, size_t size, loff_t *ppos)
+{
+  int pid;
+  int err = kstrtoint_from_user(user_buf, size, 10, &pid);
 
-static struct dentry *dentry;
+  if (err) {
+    return err;
+  }
+
+  pr_info("Got %d\n", pid);
+
+  if (pid >= 0) {
+    struct task_monitor *monitor = task_monitor_new(pid);
+
+    if (!monitor) {
+      pr_err("Failed to create new task_monitor\n");
+      return -1;
+    }
+
+    list_add_tail(&monitor->list, &tasks);
+
+    char file_name[64];
+
+    snprintf(file_name, sizeof(file_name), "%d", pid);
+    struct dentry *dfile = debugfs_create_file(file_name, 0444, dentry, monitor, &fops);
+
+    if (IS_ERR(dfile)) {
+      pr_err("Failed to create dentry");
+      return -1;
+    }
+
+    monitor->dentry = dfile;
+
+    pr_info("Created new file /sys/kernel/debug/taskmonitor/%s\n", file_name);
+  } else {
+    struct task_monitor *monitor;
+
+    list_for_each_entry(monitor, &tasks, list) {
+      if (monitor->pid != -pid) {
+	continue;
+      }
+
+      debugfs_remove(monitor->dentry);
+      pr_info("Removed file for pid\n");
+    }
+  }
+
+  return size;
+}
 
 static int __init taskmonitor_init(void)
 {
   int err = -1;
+
+  INIT_LIST_HEAD(&tasks);
 
   pr_info("Initializing task_monitor struct...\n");
   init_task_monitor(&task_monitor, target);
@@ -425,12 +541,15 @@ static int __init taskmonitor_init(void)
   }
 
   //initial pid check
-  pr_info("Checking pid...\n");
-  bool sample_okay = get_sample(&task_monitor, &task_sample);
+  if (target) {
+    pr_info("Checking pid...\n");
+    struct task_sample sample;
+    bool sample_okay = get_sample(&task_monitor, &sample);
 
-  if (!sample_okay) {
-    pr_err("Failed to update the task sample\n");
-    goto out_target;
+    if (!sample_okay) {
+      pr_err("Failed to update the task sample\n");
+      goto out_target;
+    }
   }
 
   //monitor_fn kthread
@@ -464,7 +583,8 @@ static int __init taskmonitor_init(void)
 
   //debugfs
   pr_info("Creating debugfs interface...\n");
-  dentry = debugfs_create_file("taskmonitor", 0444, NULL, NULL, &fops);
+  dentry = debugfs_create_dir("taskmonitor", NULL);
+  debugfs_create_file("control", 0200, dentry, NULL, &fops);
 
   pr_info("Done!\n");
 
@@ -504,15 +624,14 @@ static void __exit taskmonitor_exit(void)
   debugfs_remove(dentry);
 
   pr_info("Freeing allocated memory...\n");
-  mutex_lock(&task_monitor.samples_lock);
-  struct task_sample *sample, *tmp;
+  task_monitor_clear_samples(&task_monitor);
+  struct task_monitor *monitor, *tmp;
 
-  list_for_each_entry_safe(sample, tmp, &task_monitor.samples, list) {
-    list_del(&sample->list);
-    put_task_sample(sample);
+  list_for_each_entry_safe(monitor, tmp, &tasks, list) {
+    task_monitor_clear_samples(monitor);
+    list_del(&monitor->list);
+    kfree(monitor);
   }
-  task_monitor.samples_size = 0;
-  mutex_unlock(&task_monitor.samples_lock);
 
   pr_info("Unregistering shrinker...\n");
   unregister_shrinker(&taskmonitor_shrinker);
