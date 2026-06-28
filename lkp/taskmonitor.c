@@ -8,6 +8,8 @@
 #include <linux/kobject.h>
 #include <linux/fs.h>
 #include <linux/mempool.h>
+#include <linux/debugfs.h>
+#include <linux/seq_file.h>
 
 #include "taskmonitor.h"
 
@@ -97,19 +99,29 @@ static struct task_sample task_sample;
 static struct task_monitor task_monitor;
 static struct task_struct *monitor_fn_handle;
 static unsigned int major;
-static struct file_operations fops;
 static struct kmem_cache *task_sample_cache;
 static mempool_t *task_sample_mempool;
+
+static void free_task_sample(struct task_sample *sample)
+{
+  kmem_cache_free(task_sample_cache, sample);
+}
 
 static void release_task_sample(struct kref *kref)
 {
   struct task_sample *sample = container_of(kref, struct task_sample, kref);
-  kmem_cache_free(task_sample_cache, sample);
+
+  free_task_sample(sample);
 }
 
 static void put_task_sample(struct task_sample *sample)
 {
   kref_put(&sample->kref, release_task_sample);
+}
+
+static void get_task_sample(struct task_sample *sample)
+{
+  kref_get(&sample->kref);
 }
 
 static unsigned long taskmonitor_count_objects(struct shrinker *shrink, struct shrink_control *sc)
@@ -170,13 +182,15 @@ static int save_sample(void)
     goto out_sample_failure;
   }
 
+  get_task_sample(sample); //increment ref here, since we use samle in list AND for printing
+
   mutex_lock(&task_monitor.samples_lock);
   list_add_tail(&sample->list, &task_monitor.samples);
   task_monitor.samples_size += 1;
   mutex_unlock(&task_monitor.samples_lock);
 
-  kref_get(&sample->kref);
   char buf[256];
+
   render_task_sample(&task_monitor, sample, buf, sizeof(buf));
   put_task_sample(sample);
   pr_info("%s\n", buf);
@@ -297,8 +311,90 @@ static long unlocked_ioctl(struct file *file, unsigned int request_nr, unsigned 
   }
 }
 
+static void *taskmonitor_seq_start(struct seq_file *seq, loff_t *pos)
+{
+  mutex_lock(&task_monitor.samples_lock);
+  loff_t n = *pos;
+  struct task_sample *sample;
+
+  list_for_each_entry(sample, &task_monitor.samples, list) {
+    if (n-- > 0) {
+      continue;
+    }
+
+    get_task_sample(sample);
+    return sample;
+  }
+
+  return NULL;
+}
+
+static void *taskmonitor_seq_next(struct seq_file *seq, void *v, loff_t *pos)
+{
+  struct task_sample *old_sample = v;
+  struct task_sample *next_sample = NULL;
+  struct task_sample *sample = old_sample;
+
+  ++*pos;
+
+  list_for_each_entry_continue(sample, &task_monitor.samples, list) {
+    get_task_sample(sample);
+    next_sample = sample;
+    break;
+  }
+
+  put_task_sample(old_sample); //decrement after we no longer need it to find the next element
+  return next_sample;
+}
+
+static void taskmonitor_seq_stop(struct seq_file *seq, void *v)
+{
+  struct task_sample *sample = v;
+
+  if (sample) {
+    put_task_sample(sample);
+  }
+  mutex_unlock(&task_monitor.samples_lock);
+}
+
+
+static int taskmonitor_seq_show(struct seq_file *seq, void *v)
+{
+  struct task_sample *sample = v;
+  char buf[256];
+
+  render_task_sample(&task_monitor, sample, buf, sizeof(buf));
+  seq_printf(seq, "%s\n", buf);
+  return 0;
+}
+
+static const struct seq_operations taskmonitor_seq_ops = {
+  .start = taskmonitor_seq_start,
+  .next  = taskmonitor_seq_next,
+  .stop  = taskmonitor_seq_stop,
+  .show  = taskmonitor_seq_show,
+};
+
+static int taskmonitor_open(struct inode *inode, struct file *file)
+{
+  return seq_open(file, &taskmonitor_seq_ops);
+}
+
+static struct file_operations fops = {
+  .owner = THIS_MODULE,
+  .unlocked_ioctl = unlocked_ioctl,
+  .open = taskmonitor_open,
+  .read = seq_read,
+  .llseek = seq_lseek,
+  .release = seq_release,
+};
+
+static struct dentry *dentry;
+
 static int __init taskmonitor_init(void)
 {
+  int err = -1;
+
   pr_info("Initializing task_monitor struct...\n");
   init_task_monitor(&task_monitor, target);
 
@@ -307,7 +403,7 @@ static int __init taskmonitor_init(void)
   task_sample_cache = KMEM_CACHE(task_sample, 0);
   if (!task_sample_cache) {
     pr_err("Failed to create slabs cache\n");
-    return -1;
+    goto out_slabs;
   }
 
   //mempool
@@ -315,42 +411,7 @@ static int __init taskmonitor_init(void)
   task_sample_mempool = mempool_create_slab_pool(16, task_sample_cache);
   if (!task_sample_mempool) {
     pr_err("Failed to initialize mempool\n");
-    return -1;
-  }
-
-  pr_info("Checking pid...\n");
-  bool sample_okay = get_sample(&task_monitor, &task_sample);
-
-  if (!sample_okay) {
-    pr_err("Failed to update the task sample\n");
-    return -1;
-  }
-
-  //monitor_fn kthread
-  pr_info("Starting monitoring thread...\n");
-  int monitor_fn_err = start_monitor_fn();
-
-  if (monitor_fn_err) {
-    pr_err("Failed to start monitor thread\n");
-    return monitor_fn_err;
-  }
-
-  //sysfs
-  pr_info("Creating sysfs interface...\n");
-  int sysfs_err = sysfs_create_file(kernel_kobj, &monitor_attribute.attr);
-
-  if (sysfs_err) {
-    pr_err("Failed to create sysfs file\n");
-    return sysfs_err;
-  }
-
-  //ioctl
-  pr_info("Creating ioctl interface...\n");
-  fops.unlocked_ioctl = unlocked_ioctl;
-  major = register_chrdev(0, "taskmonitor", &fops);
-  if (major < 0) {
-    pr_err("Failed to register ioctl device\n");
-    return major;
+    goto out_mempool;
   }
 
   //shrinker
@@ -359,12 +420,71 @@ static int __init taskmonitor_init(void)
 
   if (shrinker_err) {
     pr_err("Failed to register shrinker\n");
-    return shrinker_err;
+    err = shrinker_err;
+    goto out_shrinker;
   }
+
+  //initial pid check
+  pr_info("Checking pid...\n");
+  bool sample_okay = get_sample(&task_monitor, &task_sample);
+
+  if (!sample_okay) {
+    pr_err("Failed to update the task sample\n");
+    goto out_target;
+  }
+
+  //monitor_fn kthread
+  pr_info("Starting monitoring thread...\n");
+  int monitor_fn_err = start_monitor_fn();
+
+  if (monitor_fn_err) {
+    pr_err("Failed to start monitor thread\n");
+    err = monitor_fn_err;
+    goto out_monitor_fn;
+  }
+
+  //sysfs
+  pr_info("Creating sysfs interface...\n");
+  int sysfs_err = sysfs_create_file(kernel_kobj, &monitor_attribute.attr);
+
+  if (sysfs_err) {
+    pr_err("Failed to create sysfs file\n");
+    err = sysfs_err;
+    goto out_sysfs;
+  }
+
+  //ioctl
+  pr_info("Creating ioctl interface...\n");
+  major = register_chrdev(0, "taskmonitor", &fops);
+  if (major < 0) {
+    pr_err("Failed to register ioctl device\n");
+    err = major;
+    goto out_ioctl;
+  }
+
+  //debugfs
+  pr_info("Creating debugfs interface...\n");
+  dentry = debugfs_create_file("taskmonitor", 0444, NULL, NULL, &fops);
 
   pr_info("Done!\n");
 
   return 0;
+
+
+  // unregister_chrdev(major, "taskmonitor");
+out_ioctl:
+  sysfs_remove_file(kernel_kobj, &monitor_attribute.attr);
+out_sysfs:
+  stop_monitor_fn();
+out_monitor_fn:
+out_target:
+  unregister_shrinker(&taskmonitor_shrinker);
+out_shrinker:
+  mempool_destroy(task_sample_mempool);
+out_mempool:
+  kmem_cache_destroy(task_sample_cache);
+out_slabs:
+  return err;
 }
 
 module_init(taskmonitor_init);
@@ -379,6 +499,9 @@ static void __exit taskmonitor_exit(void)
 
   pr_info("Removing ioctl interface...\n");
   unregister_chrdev(major, "taskmonitor");
+
+  pr_info("Removing debugfs interface...\n");
+  debugfs_remove(dentry);
 
   pr_info("Freeing allocated memory...\n");
   mutex_lock(&task_monitor.samples_lock);
